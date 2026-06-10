@@ -1,0 +1,261 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MercaSimple — Docker Compose (production-like)
+# Run:  docker compose --env-file .env up --build
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Infrastructure ─────────────────────────────────────────────────────────
+
+  db-auth:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       ${AUTH_DB_NAME}
+      POSTGRES_USER:     ${AUTH_DB_USER}
+      POSTGRES_PASSWORD: ${AUTH_DB_PASSWORD}
+    volumes:
+      - auth-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AUTH_DB_USER} -d ${AUTH_DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - mercasimple-net
+
+  db-catalog:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       ${CATALOG_DB_NAME}
+      POSTGRES_USER:     ${CATALOG_DB_USER}
+      POSTGRES_PASSWORD: ${CATALOG_DB_PASSWORD}
+    volumes:
+      - catalog-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${CATALOG_DB_USER} -d ${CATALOG_DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - mercasimple-net
+
+  db-orders:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       ${ORDERS_DB_NAME}
+      POSTGRES_USER:     ${ORDERS_DB_USER}
+      POSTGRES_PASSWORD: ${ORDERS_DB_PASSWORD}
+    volumes:
+      - orders-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ORDERS_DB_USER} -d ${ORDERS_DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - mercasimple-net
+
+  db-payments:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       ${PAYMENTS_DB_NAME}
+      POSTGRES_USER:     ${PAYMENTS_DB_USER}
+      POSTGRES_PASSWORD: ${PAYMENTS_DB_PASSWORD}
+    volumes:
+      - payments-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PAYMENTS_DB_USER} -d ${PAYMENTS_DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - mercasimple-net
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    networks:
+      - mercasimple-net
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - mercasimple-net
+
+  # ── Microservices ───────────────────────────────────────────────────────────
+
+  auth-service:
+    build:
+      context: ./auth-service
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV:          production
+      PORT:              3001
+      AUTH_DB_HOST:      db-auth
+      AUTH_DB_PORT:      5432
+    depends_on:
+      db-auth:
+        condition: service_healthy
+    networks:
+      - mercasimple-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3001/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  catalog-service:
+    build:
+      context: ./catalog-service
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV:          production
+      PORT:              3002
+      CATALOG_DB_HOST:   db-catalog
+      CATALOG_DB_PORT:   5432
+    depends_on:
+      db-catalog:
+        condition: service_healthy
+    networks:
+      - mercasimple-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3002/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  orders-service:
+    build:
+      context: ./orders-service
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV:              production
+      PORT:                  3003
+      ORDERS_DB_HOST:        db-orders
+      ORDERS_DB_PORT:        5432
+      CATALOG_SERVICE_URL:   http://catalog-service:3002
+      REDIS_URL:             redis://redis:6379
+      RABBITMQ_URL:          amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672
+    depends_on:
+      db-orders:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      catalog-service:
+        condition: service_healthy
+    networks:
+      - mercasimple-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3003/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  payments-service:
+    build:
+      context: ./payments-service
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV:          production
+      PORT:              3004
+      PAYMENTS_DB_HOST:  db-payments
+      PAYMENTS_DB_PORT:  5432
+      RABBITMQ_URL:      amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672
+    depends_on:
+      db-payments:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - mercasimple-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3004/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  # ── API Gateway ─────────────────────────────────────────────────────────────
+
+  api-gateway:
+    build:
+      context: ./api-gateway
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${GATEWAY_PORT:-8080}:8080"
+    depends_on:
+      auth-service:
+        condition: service_healthy
+      catalog-service:
+        condition: service_healthy
+      orders-service:
+        condition: service_healthy
+    networks:
+      - mercasimple-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+# ── Volumes ──────────────────────────────────────────────────────────────────
+
+volumes:
+  auth-data:
+  catalog-data:
+  orders-data:
+  payments-data:
+  redis-data:
+  rabbitmq-data:
+
+# ── Networks ─────────────────────────────────────────────────────────────────
+
+networks:
+  mercasimple-net:
+    driver: bridge

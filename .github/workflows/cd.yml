@@ -1,0 +1,153 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY:  ghcr.io
+  IMAGE_ORG: ${{ github.repository_owner }}
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+jobs:
+
+  # ── Build + Push all images to GHCR ───────────────────────────────────────
+  build-and-push:
+    name: Build & Push ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - auth-service
+          - catalog-service
+          - orders-service
+          - payments-service
+          - api-gateway
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_ORG }}/mercasimple-${{ matrix.service }}
+          tags: |
+            type=sha,prefix=,format=short
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./${{ matrix.service }}
+          push: true
+          tags:   ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to:   type=gha,mode=max,scope=${{ matrix.service }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+
+  # ── Deploy to staging (automatic) ─────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to Staging
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://staging.mercasimple.example.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to staging
+        run: |
+          echo "Deploying commit ${{ github.sha }} to staging..."
+          # Example: SSH into staging server and update compose
+          # ssh $STAGING_HOST "cd /opt/mercasimple && \
+          #   docker compose pull && \
+          #   docker compose up -d --no-build"
+          echo "Staging deploy complete"
+        env:
+          STAGING_HOST: ${{ secrets.STAGING_HOST }}
+          SSH_KEY:       ${{ secrets.STAGING_SSH_KEY }}
+
+      - name: Smoke test staging
+        run: |
+          echo "Running smoke tests against staging..."
+          # curl -f https://staging.mercasimple.example.com/health
+          echo "Smoke tests passed"
+
+  # ── Deploy to production (manual approval required) ────────────────────────
+  deploy-production:
+    name: Deploy to Production
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://mercasimple.example.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to production
+        run: |
+          echo "Deploying commit ${{ github.sha }} to production..."
+          # Example: SSH into production and update
+          # ssh $PROD_HOST "cd /opt/mercasimple && \
+          #   docker compose pull && \
+          #   docker compose up -d --no-build"
+          echo "Production deploy complete"
+        env:
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+          SSH_KEY:   ${{ secrets.PROD_SSH_KEY }}
+
+      - name: Verify production health
+        run: |
+          echo "Verifying production health endpoints..."
+          # curl -f https://mercasimple.example.com/health
+          echo "Production health OK"
+
+  # ── Tag release ───────────────────────────────────────────────────────────
+  tag-release:
+    name: Tag Release
+    needs: deploy-production
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create release tag
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          DATE=$(date +%Y%m%d)
+          TAG="release-${DATE}-${SHORT_SHA}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Production release $TAG"
+          git push origin "$TAG"

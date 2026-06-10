@@ -1,0 +1,85 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Development overrides — hot-reload + exposed ports
+# Merged automatically by:  docker compose up
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Expose infra ports locally ─────────────────────────────────────────────
+
+  db-auth:
+    ports:
+      - "5433:5432"
+
+  db-catalog:
+    ports:
+      - "5434:5432"
+
+  db-orders:
+    ports:
+      - "5435:5432"
+
+  db-payments:
+    ports:
+      - "5436:5432"
+
+  redis:
+    ports:
+      - "6379:6379"
+
+  rabbitmq:
+    ports:
+      - "5672:5672"
+      - "15672:15672"   # Management UI
+
+  # ── Services in dev mode (hot-reload) ─────────────────────────────────────
+
+  auth-service:
+    build:
+      context: ./auth-service
+      target: build
+    command: npm run start:dev
+    environment:
+      NODE_ENV: development
+    volumes:
+      - ./auth-service/src:/app/src:ro
+    ports:
+      - "3001:3001"
+
+  catalog-service:
+    build:
+      context: ./catalog-service
+      target: build
+    command: npm run start:dev
+    environment:
+      NODE_ENV: development
+    volumes:
+      - ./catalog-service/src:/app/src:ro
+    ports:
+      - "3002:3002"
+
+  orders-service:
+    build:
+      context: ./orders-service
+      target: build
+    command: npm run start:dev
+    environment:
+      NODE_ENV: development
+    volumes:
+      - ./orders-service/src:/app/src:ro
+    ports:
+      - "3003:3003"
+
+  payments-service:
+    build:
+      context: ./payments-service
+      target: build
+    command: npm run start:dev
+    environment:
+      NODE_ENV: development
+    volumes:
+      - ./payments-service/src:/app/src:ro
+    ports:
+      - "3004:3004"
