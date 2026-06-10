@@ -1,72 +1,162 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# ci.yml  →  Pipeline de Integración Continua (CI)
+#
+# PROPÓSITO:
+#   Verificar automáticamente que el código nuevo NO rompe nada antes de
+#   que sea mergeado a las ramas principales. Si algo falla, el merge queda
+#   BLOQUEADO en GitHub (status checks obligatorios).
+#
+# FLUJO COMPLETO:
+#   [push/PR] → test (×4 servicios en paralelo) → docker-build (×5) → scan (×4)
+#
+# REGLA DE ORO:
+#   Si cualquier job de este pipeline falla → no se puede hacer merge.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Nombre del workflow. Aparece en la pestaña "Actions" de GitHub.
 name: CI
 
+# ══════════════════════════════════════════════════════════════════════════════
+# TRIGGERS: Cuándo se dispara este workflow
+# ══════════════════════════════════════════════════════════════════════════════
 on:
+  # Se ejecuta cuando alguien hace "git push" directamente a estas ramas
   push:
     branches: [main, develop]
+
+  # Se ejecuta cuando alguien abre o actualiza un Pull Request hacia estas ramas
   pull_request:
     branches: [main, develop]
 
+# ══════════════════════════════════════════════════════════════════════════════
+# PERMISSIONS: Permisos mínimos que el workflow necesita
+# Principio de mínimo privilegio (RS-06 del documento de requerimientos).
+# Si no declaras permissions, GitHub otorga permisos amplios por defecto → riesgo.
+# ══════════════════════════════════════════════════════════════════════════════
 permissions:
-  contents: read
-  packages: read
-  pull-requests: write
+  contents: read       # Leer el código del repositorio (checkout)
+  packages: read       # Leer packages de GHCR (pull de imágenes base si fuera necesario)
+  pull-requests: write # Escribir comentarios en el PR (ej: publicar reporte de cobertura)
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ENV: Variables de entorno globales para TODOS los jobs del workflow
+# ══════════════════════════════════════════════════════════════════════════════
 env:
+  # Versión de Node.js que usan todos los servicios.
+  # Definirla aquí en un solo lugar facilita actualizarla cuando suba la versión.
   NODE_VERSION: "20"
 
-# ─────────────────────────────────────────────────────────────────────────────
-
+# ══════════════════════════════════════════════════════════════════════════════
+# JOBS: Las tareas que ejecuta el pipeline
+# Cada job corre en una máquina virtual limpia (runner de GitHub).
+# Por defecto los jobs corren EN PARALELO a menos que uses "needs:".
+# ══════════════════════════════════════════════════════════════════════════════
 jobs:
 
-  # ── Lint + Test each service in parallel ───────────────────────────────────
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 1: "test"
+  # Instala dependencias, hace lint y corre pruebas con cobertura.
+  # Usa una MATRIX para correr el mismo job en PARALELO para los 4 servicios.
+  # ────────────────────────────────────────────────────────────────────────────
   test:
+    # Nombre visible en GitHub. ${{ matrix.service }} se reemplaza en tiempo real,
+    # generando: "Test auth-service", "Test catalog-service", etc.
     name: Test ${{ matrix.service }}
+
+    # Runner = tipo de máquina virtual donde corre el job.
+    # "ubuntu-latest" → Ubuntu LTS más reciente disponible en GitHub Actions.
+    # Es gratuita para repos públicos; tiene Docker, Node.js, npm preinstalados.
     runs-on: ubuntu-latest
+
+    # STRATEGY + MATRIX: Multiplica el job para cada valor de la lista.
+    # En vez de escribir 4 jobs idénticos, escribes uno con una variable.
     strategy:
+      # fail-fast: false → Si falla "auth-service", los otros 3 SIGUEN corriendo.
+      # Con true (default), un fallo cancela todos. false = más info de debugging.
       fail-fast: false
       matrix:
+        # Esta lista genera 4 ejecuciones paralelas del job "test".
+        # En cada una, matrix.service tendrá un valor diferente.
         service:
           - auth-service
           - catalog-service
           - orders-service
           - payments-service
 
+    # STEPS: Secuencia de pasos que se ejecutan en orden dentro del job.
+    # Si un step falla, los siguientes NO se ejecutan (el job falla).
     steps:
+
+      # Step 1: Descarga el código del repositorio en el runner.
+      # Sin esto el runner está vacío. @v4 = versión 4 de la acción oficial.
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # Step 2: Instala Node.js en el runner y activa el caché de npm.
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
+          node-version: ${{ env.NODE_VERSION }}   # Usa la variable global definida arriba
+          cache: npm                               # Tipo de caché (también soporta "yarn", "pnpm")
+          # GitHub cachea la carpeta ~/.npm basándose en el hash del package-lock.json.
+          # Si el lock no cambió, npm ci reutiliza el caché → mucho más rápido.
           cache-dependency-path: ${{ matrix.service }}/package-lock.json
 
+      # Step 3: Instala dependencias de forma REPRODUCIBLE.
+      # "npm ci" (clean install) es más estricto que "npm install":
+      #   - Siempre elimina node_modules antes de instalar
+      #   - Falla si package.json y package-lock.json están desincronizados
+      #   - No modifica el lock file → builds deterministas
       - name: Install dependencies
-        working-directory: ${{ matrix.service }}
+        working-directory: ${{ matrix.service }}   # Entra a la carpeta del servicio
         run: npm ci
 
+      # Step 4: Análisis estático del código (linting).
+      # ESLint busca errores de estilo, variables sin usar, código peligroso, etc.
+      # "|| true" al final hace que aunque ESLint falle, el step NO cancele el job.
+      # Útil mientras se termina de configurar el linter en todos los servicios.
+      # En producción deberías quitar el "|| true" para que el lint sea obligatorio.
       - name: Lint
         working-directory: ${{ matrix.service }}
-        run: npm run lint || true   # non-blocking until eslint config is added
+        run: npm run lint || true
 
+      # Step 5: Ejecuta los tests unitarios Y genera reporte de cobertura.
+      # "npm run test:cov" es equivalente a: jest --coverage
+      # Si la cobertura cae del umbral definido en package.json (70%), el job FALLA.
       - name: Run unit tests with coverage
         working-directory: ${{ matrix.service }}
         run: npm run test:cov
         env:
+          # La variable CI=true hace que Jest no use colores en el output
+          # y active comportamientos específicos para entornos CI (sin TTY).
           CI: true
 
+      # Step 6: Guarda el reporte de cobertura como "artifact" de GitHub.
+      # Los artifacts son archivos adjuntos al workflow run, descargables desde
+      # la interfaz de GitHub por 7 días. Útil para auditar cobertura.
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         with:
+          # Nombre único por servicio para no sobrescribir entre sí
           name: coverage-${{ matrix.service }}
+          # Ruta del reporte generado por Jest (carpeta coverage/)
           path: ${{ matrix.service }}/coverage/
+          # Después de 7 días GitHub elimina el artifact automáticamente
           retention-days: 7
 
-  # ── Docker build (verify images compile) ──────────────────────────────────
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 2: "docker-build"
+  # Construye las imágenes Docker para verificar que el Dockerfile no está roto.
+  # NO las sube a ningún registry (push: false). Solo valida que compilan bien.
+  # Corre DESPUÉS de que todos los tests pasen (needs: test).
+  # ────────────────────────────────────────────────────────────────────────────
   docker-build:
     name: Docker build ${{ matrix.service }}
+
+    # "needs: test" → Este job NO empieza hasta que el job "test" haya terminado
+    # con éxito. Si algún servicio falla en test, docker-build no se ejecuta.
     needs: test
+
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -76,32 +166,58 @@ jobs:
           - catalog-service
           - orders-service
           - payments-service
-          - api-gateway
+          - api-gateway    # El gateway también se verifica (es solo Nginx, muy rápido)
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # Instala Docker Buildx: el motor de build avanzado de Docker.
+      # Soporta multi-platform builds, caché distribuido (type=gha), builds más rápidos.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Construye la imagen Docker del servicio pero NO la hace push.
       - name: Build Docker image
         uses: docker/build-push-action@v5
         with:
+          # Ruta al Dockerfile del servicio (./auth-service, ./catalog-service, etc.)
           context: ./${{ matrix.service }}
-          push: false
-          tags: mercasimple/${{ matrix.service }}:${{ github.sha }}
-          cache-from: type=gha,scope=${{ matrix.service }}
-          cache-to:   type=gha,mode=max,scope=${{ matrix.service }}
 
-  # ── Vulnerability scan ────────────────────────────────────────────────────
+          # push: false → Solo construye localmente para validar. No sube a ningún registro.
+          push: false
+
+          # Tag de la imagen: nombre:sha-del-commit
+          # github.sha = hash completo del commit que disparó el workflow (ej: a3f9b2c...)
+          tags: mercasimple/${{ matrix.service }}:${{ github.sha }}
+
+          # CACHÉ de layers de Docker entre ejecuciones del workflow.
+          # type=gha → usa el caché nativo de GitHub Actions (almacenamiento gratis incluido).
+          # scope → segmenta el caché por servicio para que no se mezclen.
+          cache-from: type=gha,scope=${{ matrix.service }}
+          # mode=max → cachea TODAS las capas, incluyendo las intermedias.
+          # Esto hace que builds subsiguientes sean muy rápidos si el código no cambió.
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 3: "scan"
+  # Escanea dependencias buscando vulnerabilidades de seguridad conocidas.
+  # Corre DESPUÉS de docker-build (cuando ya sabemos que los Dockerfiles compilan).
+  # ────────────────────────────────────────────────────────────────────────────
   scan:
     name: Scan ${{ matrix.service }}
+
+    # Espera a que docker-build termine exitosamente
     needs: docker-build
+
     runs-on: ubuntu-latest
+
+    # Permisos adicionales para este job específico.
+    # security-events: write → necesario para subir resultados SARIF a GitHub Security tab.
     permissions:
       contents: read
       security-events: write
+
     strategy:
       fail-fast: false
       matrix:
@@ -126,6 +242,11 @@ jobs:
         working-directory: ${{ matrix.service }}
         run: npm ci
 
+      # "npm audit" analiza el package-lock.json contra la base de datos de
+      # vulnerabilidades de npm (NVD + advisories propios de npm).
+      # --audit-level=high → solo falla si hay vulnerabilidades HIGH o CRITICAL.
+      # Las vulnerabilidades LOW y MODERATE se reportan pero no bloquean.
+      # "|| true" → no bloquea el build todavía; quitar en producción madura.
       - name: Audit dependencies
         working-directory: ${{ matrix.service }}
         run: npm audit --audit-level=high || true

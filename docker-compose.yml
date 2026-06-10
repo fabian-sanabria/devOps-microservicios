@@ -1,32 +1,79 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# docker-compose.yml  →  Configuración de PRODUCCIÓN (o similar a producción)
+#
+# CÓMO USARLO:
+#   cp .env.example .env          # 1. Crea tu archivo de variables
+#   docker compose up --build     # 2. Construye y levanta TODO el sistema
+#
+# Este archivo define TODOS los contenedores del sistema MercaSimple.
+# El archivo docker-compose.override.yml (para desarrollo) se aplica
+# encima de este automáticamente cuando ejecutas "docker compose up".
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Versión del esquema de Docker Compose que se usa.
+# "3.9" soporta todas las funcionalidades modernas: healthcheck con condition,
+# depends_on condicional, secrets, configs, etc.
 version: "3.9"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MercaSimple — Docker Compose (production-like)
-# Run:  docker compose --env-file .env up --build
-# ─────────────────────────────────────────────────────────────────────────────
-
+# ══════════════════════════════════════════════════════════════════════════════
+# SECCIÓN SERVICES
+# Aquí defines cada contenedor que Docker va a levantar.
+# Cada clave de primer nivel dentro de "services:" es el NOMBRE del servicio,
+# que también actúa como hostname DNS interno dentro de la red Docker.
+# ══════════════════════════════════════════════════════════════════════════════
 services:
 
-  # ── Infrastructure ─────────────────────────────────────────────────────────
+  # ────────────────────────────────────────────────────────────────────────────
+  # INFRAESTRUCTURA: Bases de datos, caché y mensajería
+  # Estos servicios NO tienen lógica de negocio, son dependencias externas.
+  # ────────────────────────────────────────────────────────────────────────────
 
+  # ── Base de datos exclusiva del auth-service ─────────────────────────────
   db-auth:
+    # Usamos la imagen oficial de PostgreSQL versión 16 en variante Alpine
+    # (Alpine = distribución Linux muy ligera, ~5MB vs ~80MB de la imagen normal)
     image: postgres:16-alpine
+
+    # restart: unless-stopped → Si el contenedor se cae por error, Docker lo
+    # reinicia automáticamente. EXCEPTO si tú mismo lo detuviste a propósito
+    # con "docker compose stop". Alternativas: "always", "on-failure", "no".
     restart: unless-stopped
+
+    # Variables de entorno que la imagen de Postgres lee al iniciarse por
+    # primera vez para crear la base de datos, el usuario y la contraseña.
+    # Los valores ${...} se leen del archivo .env en tiempo de ejecución.
     environment:
-      POSTGRES_DB:       ${AUTH_DB_NAME}
-      POSTGRES_USER:     ${AUTH_DB_USER}
-      POSTGRES_PASSWORD: ${AUTH_DB_PASSWORD}
+      POSTGRES_DB:       ${AUTH_DB_NAME}       # Nombre de la base de datos a crear
+      POSTGRES_USER:     ${AUTH_DB_USER}       # Usuario administrador de esa DB
+      POSTGRES_PASSWORD: ${AUTH_DB_PASSWORD}   # Contraseña del usuario
+
+    # Monta un volumen nombrado para PERSISTIR los datos.
+    # Sin esto, si el contenedor se elimina, pierdes todos los datos.
+    # "auth-data" es el nombre del volumen (declarado al final del archivo).
+    # "/var/lib/postgresql/data" es la ruta donde Postgres guarda su data.
     volumes:
       - auth-data:/var/lib/postgresql/data
+
+    # HEALTHCHECK: Prueba periódica para saber si el servicio está REALMENTE
+    # listo para aceptar conexiones (no solo "corriendo").
+    # Esto es clave porque "depends_on: condition: service_healthy" de otros
+    # servicios espera a que este healthcheck sea exitoso.
     healthcheck:
+      # pg_isready es una herramienta de Postgres que verifica si el servidor
+      # acepta conexiones. -U = usuario, -d = nombre de la base de datos.
       test: ["CMD-SHELL", "pg_isready -U ${AUTH_DB_USER} -d ${AUTH_DB_NAME}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 15s
+      interval: 10s      # Cada cuánto tiempo Docker repite el test
+      timeout: 5s        # Tiempo máximo que puede tardar el test antes de fallar
+      retries: 5         # Cuántos fallos consecutivos se permiten antes de marcar "unhealthy"
+      start_period: 15s  # Tiempo de gracia al inicio: no cuenta fallos en estos primeros 15s
+
+    # Conecta este contenedor a la red interna "mercasimple-net".
+    # Solo los contenedores en la misma red pueden comunicarse entre sí.
     networks:
       - mercasimple-net
 
+  # ── Base de datos exclusiva del catalog-service ──────────────────────────
+  # (Mismo patrón que db-auth, pero para el catálogo)
   db-catalog:
     image: postgres:16-alpine
     restart: unless-stopped
@@ -45,6 +92,7 @@ services:
     networks:
       - mercasimple-net
 
+  # ── Base de datos exclusiva del orders-service ───────────────────────────
   db-orders:
     image: postgres:16-alpine
     restart: unless-stopped
@@ -63,6 +111,7 @@ services:
     networks:
       - mercasimple-net
 
+  # ── Base de datos exclusiva del payments-service ─────────────────────────
   db-payments:
     image: postgres:16-alpine
     restart: unless-stopped
@@ -81,63 +130,111 @@ services:
     networks:
       - mercasimple-net
 
+  # ── Redis: caché para el carrito de compras ──────────────────────────────
   redis:
+    # Redis 7 en Alpine. Redis es una base de datos en memoria clave-valor,
+    # usada aquí para guardar el carrito de cada usuario con TTL (expiración).
     image: redis:7-alpine
     restart: unless-stopped
+
+    # Sobrescribe el comando por defecto de la imagen:
+    # --save 60 1   → Guarda a disco si hubo al menos 1 cambio en 60 segundos
+    # --loglevel warning → Solo muestra logs de advertencias o errores (menos ruido)
     command: redis-server --save 60 1 --loglevel warning
+
     volumes:
+      # Persiste los datos del carrito entre reinicios del contenedor
       - redis-data:/data
+
     healthcheck:
+      # "redis-cli ping" responde "PONG" si Redis está sano
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 3s
       retries: 5
       start_period: 10s
+
     networks:
       - mercasimple-net
 
+  # ── RabbitMQ: cola de mensajes para pagos asincrónicos ───────────────────
   rabbitmq:
+    # Versión con management = incluye interfaz web en el puerto 15672
+    # Útil para ver colas, mensajes, consumidores desde el navegador.
     image: rabbitmq:3.13-management-alpine
     restart: unless-stopped
+
     environment:
+      # Usuario y contraseña del broker. El ":-guest" es un valor DEFAULT:
+      # si RABBITMQ_USER no está en el .env, usa "guest" como fallback.
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+
     volumes:
+      # Persiste las colas y mensajes entre reinicios
       - rabbitmq-data:/var/lib/rabbitmq
+
     healthcheck:
+      # rabbitmq-diagnostics ping verifica que el nodo RabbitMQ responde
       test: ["CMD", "rabbitmq-diagnostics", "ping"]
       interval: 15s
       timeout: 10s
       retries: 5
+      # RabbitMQ tarda más en iniciar que Postgres, por eso 30s de gracia
       start_period: 30s
+
     networks:
       - mercasimple-net
 
-  # ── Microservices ───────────────────────────────────────────────────────────
+  # ════════════════════════════════════════════════════════════════════════════
+  # MICROSERVICIOS: La lógica de negocio de MercaSimple
+  # Estos se construyen desde el código fuente local con "build:".
+  # ════════════════════════════════════════════════════════════════════════════
 
+  # ── auth-service: registro, login, perfiles, JWT ─────────────────────────
   auth-service:
     build:
+      # context → carpeta que Docker Buildx usará como raíz para el build.
+      # Todos los COPY del Dockerfile son relativos a esta carpeta.
       context: ./auth-service
+      # Nombre explícito del Dockerfile a usar (por defecto es "Dockerfile")
       dockerfile: Dockerfile
+
     restart: unless-stopped
+
+    # Carga TODAS las variables del archivo .env como variables de entorno.
+    # Es la forma más cómoda de pasar credenciales sin hardcodearlas.
     env_file: .env
+
+    # Estas variables SE SUMAN a las del env_file y las SOBREESCRIBEN si hay conflicto.
+    # Úsalas para valores que dependen de la topología Docker (hostnames de red).
     environment:
-      NODE_ENV:          production
-      PORT:              3001
-      AUTH_DB_HOST:      db-auth
-      AUTH_DB_PORT:      5432
+      NODE_ENV:     production  # Activa optimizaciones de producción en Node.js
+      PORT:         3001        # Puerto interno en el que escucha el servicio
+      AUTH_DB_HOST: db-auth     # Hostname → resuelve al contenedor "db-auth" en la red Docker
+      AUTH_DB_PORT: 5432        # Puerto estándar de PostgreSQL
+
+    # depends_on con condition: service_healthy → Docker NO arranca auth-service
+    # hasta que db-auth pase su healthcheck. Garantiza orden correcto de inicio.
     depends_on:
       db-auth:
-        condition: service_healthy
+        condition: service_healthy  # Espera a que db-auth esté "healthy", no solo "running"
+
     networks:
       - mercasimple-net
+
+    # Healthcheck propio de auth-service. Usa wget porque Alpine no tiene curl.
+    # -qO- → silencioso, vuelca la respuesta a stdout.
+    # Si /health devuelve HTTP 2xx, el test pasa. Si no, falla.
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:3001/health || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 5
+      # 40s de gracia porque NestJS tarda en compilar y conectarse a la DB
       start_period: 40s
 
+  # ── catalog-service: CRUD de productos, búsqueda, paginación ─────────────
   catalog-service:
     build:
       context: ./catalog-service
@@ -145,10 +242,10 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      NODE_ENV:          production
-      PORT:              3002
-      CATALOG_DB_HOST:   db-catalog
-      CATALOG_DB_PORT:   5432
+      NODE_ENV:        production
+      PORT:            3002
+      CATALOG_DB_HOST: db-catalog  # Hostname interno hacia la DB del catálogo
+      CATALOG_DB_PORT: 5432
     depends_on:
       db-catalog:
         condition: service_healthy
@@ -161,6 +258,7 @@ services:
       retries: 5
       start_period: 40s
 
+  # ── orders-service: carrito (Redis), pedidos, descuento de stock ─────────
   orders-service:
     build:
       context: ./orders-service
@@ -168,13 +266,21 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      NODE_ENV:              production
-      PORT:                  3003
-      ORDERS_DB_HOST:        db-orders
-      ORDERS_DB_PORT:        5432
-      CATALOG_SERVICE_URL:   http://catalog-service:3002
-      REDIS_URL:             redis://redis:6379
-      RABBITMQ_URL:          amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672
+      NODE_ENV:            production
+      PORT:                3003
+      ORDERS_DB_HOST:      db-orders
+      ORDERS_DB_PORT:      5432
+      # URL del catalog-service para consultar productos y descontar stock
+      # Usa el nombre del servicio como hostname (resuelto por DNS interno de Docker)
+      CATALOG_SERVICE_URL: http://catalog-service:3002
+      # URL de Redis para el carrito
+      REDIS_URL:           redis://redis:6379
+      # URL de RabbitMQ. Se construye con las variables del .env.
+      # amqp://usuario:contraseña@host:puerto
+      RABBITMQ_URL:        amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672
+
+    # orders-service necesita que estén listos: su DB, Redis, RabbitMQ Y catalog-service
+    # (porque al crear un pedido, llama a catalog-service para verificar stock)
     depends_on:
       db-orders:
         condition: service_healthy
@@ -184,6 +290,7 @@ services:
         condition: service_healthy
       catalog-service:
         condition: service_healthy
+
     networks:
       - mercasimple-net
     healthcheck:
@@ -191,8 +298,10 @@ services:
       interval: 15s
       timeout: 5s
       retries: 5
+      # 60s porque este servicio tiene más dependencias que inicializar
       start_period: 60s
 
+  # ── payments-service: cobro simulado, idempotencia, RabbitMQ ─────────────
   payments-service:
     build:
       context: ./payments-service
@@ -200,16 +309,20 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      NODE_ENV:          production
-      PORT:              3004
-      PAYMENTS_DB_HOST:  db-payments
-      PAYMENTS_DB_PORT:  5432
-      RABBITMQ_URL:      amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672
+      NODE_ENV:         production
+      PORT:             3004
+      PAYMENTS_DB_HOST: db-payments
+      PAYMENTS_DB_PORT: 5432
+      # payments-service escucha la cola "payment.requests" de RabbitMQ
+      # y publica resultados en "payment.results"
+      RABBITMQ_URL:     amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672
+
     depends_on:
       db-payments:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+
     networks:
       - mercasimple-net
     healthcheck:
@@ -219,15 +332,25 @@ services:
       retries: 5
       start_period: 60s
 
-  # ── API Gateway ─────────────────────────────────────────────────────────────
-
+  # ────────────────────────────────────────────────────────────────────────────
+  # API GATEWAY: Punto de entrada único al sistema (Nginx)
+  # ────────────────────────────────────────────────────────────────────────────
   api-gateway:
     build:
       context: ./api-gateway
       dockerfile: Dockerfile
     restart: unless-stopped
+
+    # ports → El ÚNICO servicio que expone un puerto al host (tu máquina).
+    # "HOST:CONTENEDOR" → puerto 8080 de tu máquina → puerto 8080 del contenedor.
+    # ${GATEWAY_PORT:-8080} → usa la variable del .env, o 8080 por defecto.
+    # Los demás servicios NO exponen puertos: solo se comunican entre sí internamente.
     ports:
       - "${GATEWAY_PORT:-8080}:8080"
+
+    # El gateway solo arranca cuando los 3 microservicios principales están sanos.
+    # Así se garantiza que cuando el gateway recibe tráfico, todos los backends
+    # ya están listos para responder.
     depends_on:
       auth-service:
         condition: service_healthy
@@ -235,27 +358,46 @@ services:
         condition: service_healthy
       orders-service:
         condition: service_healthy
+
     networks:
       - mercasimple-net
+
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
       interval: 15s
       timeout: 5s
+      # Solo 3 reintentos: Nginx es muy rápido al iniciar
       retries: 3
       start_period: 15s
 
-# ── Volumes ──────────────────────────────────────────────────────────────────
-
+# ══════════════════════════════════════════════════════════════════════════════
+# SECCIÓN VOLUMES
+# Declara los volúmenes nombrados usados arriba.
+# Docker los crea y gestiona automáticamente en el host.
+# Los datos sobreviven a "docker compose down" pero NO a "docker compose down -v"
+# (la flag -v elimina los volúmenes, útil para reset total).
+#
+# Para ver dónde viven en tu máquina:
+#   docker volume inspect mercasimple_auth-data
+# ══════════════════════════════════════════════════════════════════════════════
 volumes:
-  auth-data:
-  catalog-data:
-  orders-data:
-  payments-data:
-  redis-data:
-  rabbitmq-data:
+  auth-data:       # Datos de PostgreSQL del auth-service
+  catalog-data:    # Datos de PostgreSQL del catalog-service
+  orders-data:     # Datos de PostgreSQL del orders-service
+  payments-data:   # Datos de PostgreSQL del payments-service
+  redis-data:      # Snapshot del carrito en Redis
+  rabbitmq-data:   # Estado de colas y mensajes de RabbitMQ
 
-# ── Networks ─────────────────────────────────────────────────────────────────
-
+# ══════════════════════════════════════════════════════════════════════════════
+# SECCIÓN NETWORKS
+# Define las redes virtuales Docker.
+# Todos los servicios conectados a "mercasimple-net" pueden verse entre sí
+# usando su nombre de servicio como hostname (ej: "db-auth", "redis").
+# Los servicios en redes diferentes NO se ven, lo que aumenta el aislamiento.
+#
+# driver: bridge → Red privada en el host, la más común para desarrollo/staging.
+# Alternativas: "overlay" (para Docker Swarm), "host" (sin aislamiento de red).
+# ══════════════════════════════════════════════════════════════════════════════
 networks:
   mercasimple-net:
     driver: bridge

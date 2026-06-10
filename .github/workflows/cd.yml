@@ -1,27 +1,66 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# cd.yml  →  Pipeline de Entrega/Despliegue Continuo (CD)
+#
+# PROPÓSITO:
+#   Cuando el código pasa el CI y se mergea a "main", este pipeline:
+#   1. Construye imágenes Docker de producción
+#   2. Las publica en el registro de imágenes (GHCR - GitHub Container Registry)
+#   3. Despliega automáticamente en el entorno de STAGING
+#   4. Espera APROBACIÓN MANUAL antes de desplegar en PRODUCCIÓN
+#   5. Crea un tag Git que marca el release
+#
+# FLUJO:
+#   merge a main → build-and-push (×5) → deploy-staging → [aprobación] → deploy-prod → tag-release
+#
+# DIFERENCIA CON CI:
+#   CI = verificar que el código funciona (en cualquier rama/PR)
+#   CD = entregar el código a producción (solo cuando llega a "main")
+# ─────────────────────────────────────────────────────────────────────────────
+
 name: CD
 
+# ══════════════════════════════════════════════════════════════════════════════
+# TRIGGER: Solo se dispara cuando hay un push a "main"
+# Esto ocurre cuando se hace merge de un PR (nunca deberías hacer push directo a main)
+# ══════════════════════════════════════════════════════════════════════════════
 on:
   push:
     branches: [main]
 
+# ══════════════════════════════════════════════════════════════════════════════
+# PERMISSIONS: Este workflow necesita escribir en packages (GHCR) para subir imágenes
+# y en contents para crear tags de release.
+# ══════════════════════════════════════════════════════════════════════════════
 permissions:
-  contents: read
-  packages: write
+  contents: read    # Leer código del repo (checkout)
+  packages: write   # Subir imágenes Docker al GitHub Container Registry (GHCR)
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ENV: Variables globales del workflow
+# ══════════════════════════════════════════════════════════════════════════════
 env:
-  REGISTRY:  ghcr.io
-  IMAGE_ORG: ${{ github.repository_owner }}
+  # GHCR = GitHub Container Registry. URL base para todas las imágenes.
+  # Las imágenes quedarán en: ghcr.io/tuorganizacion/mercasimple-auth-service:sha
+  REGISTRY: ghcr.io
 
-# ─────────────────────────────────────────────────────────────────────────────
+  # Propietario del repositorio (tu usuario u organización en GitHub).
+  # github.repository_owner es una variable automática de GitHub Actions.
+  # Si tu repo es "miempresa/mercasimple", IMAGE_ORG = "miempresa"
+  IMAGE_ORG: ${{ github.repository_owner }}
 
 jobs:
 
-  # ── Build + Push all images to GHCR ───────────────────────────────────────
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 1: "build-and-push"
+  # Construye cada imagen Docker de producción y la sube a GHCR.
+  # Usa matrix para procesar todos los servicios en paralelo.
+  # ────────────────────────────────────────────────────────────────────────────
   build-and-push:
     name: Build & Push ${{ matrix.service }}
     runs-on: ubuntu-latest
+
     strategy:
-      fail-fast: false
+      fail-fast: false   # Si falla un servicio, los otros siguen
       matrix:
         service:
           - auth-service
@@ -34,9 +73,14 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # Buildx es necesario para builds multi-platform y para el caché type=gha
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Autentica con GHCR para poder hacer "docker push".
+      # secrets.GITHUB_TOKEN es un token automático que GitHub genera en cada workflow.
+      # No necesitas configurarlo manualmente: es gratis y tiene permisos sobre el repo.
+      # username: github.actor = el usuario (o bot) que disparó el workflow
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -44,64 +88,133 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Genera automáticamente los tags y labels que tendrá la imagen.
+      # "id: meta" permite referenciar las salidas de este step más abajo.
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
+          # Nombre base de la imagen en GHCR
+          # Resultado: ghcr.io/miorg/mercasimple-auth-service
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_ORG }}/mercasimple-${{ matrix.service }}
+
+          # Define QUÉ TAGS se generan para la imagen:
           tags: |
+            # type=sha → Tag con el SHA corto del commit (primeros 7 chars)
+            # Ej: ghcr.io/miorg/mercasimple-auth-service:a3f9b2c
+            # Útil para rollback: puedes volver a exactamente ese commit
             type=sha,prefix=,format=short
+
+            # type=semver → Si el commit tiene un tag Git de versión semántica (v1.2.3),
+            # genera el tag correspondiente. Ej: ghcr.io/.../auth-service:1.2.3
             type=semver,pattern={{version}}
+
+            # type=raw → Tag "latest" SOLO si el push es a la rama main.
+            # github.ref == 'refs/heads/main' evalúa a true/false.
+            # "latest" apunta siempre a la última versión de producción.
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
+      # Construye Y SUBE la imagen a GHCR.
       - name: Build and push image
         uses: docker/build-push-action@v5
         with:
           context: ./${{ matrix.service }}
+
+          # push: true → A diferencia del CI, AQUÍ SÍ subimos la imagen.
           push: true
-          tags:   ${{ steps.meta.outputs.tags }}
+
+          # Usa los tags generados por el step "meta" anterior.
+          # steps.meta.outputs.tags contiene todas las líneas de tags generadas.
+          tags: ${{ steps.meta.outputs.tags }}
+
+          # Labels = metadatos de la imagen (autor, versión, URL del repo, etc.)
+          # La acción metadata-action los genera automáticamente según el estándar OCI.
           labels: ${{ steps.meta.outputs.labels }}
+
+          # Caché compartido entre este job de CD y los del CI (misma clave scope=servicio).
+          # Si el CI ya construyó la imagen hace unos minutos, el CD la reutiliza → muy rápido.
           cache-from: type=gha,scope=${{ matrix.service }}
-          cache-to:   type=gha,mode=max,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+          # Build args = argumentos disponibles dentro del Dockerfile durante el build.
+          # GIT_SHA puede usarse en el Dockerfile para etiquetar el binario compilado.
           build-args: |
             GIT_SHA=${{ github.sha }}
 
-  # ── Deploy to staging (automatic) ─────────────────────────────────────────
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 2: "deploy-staging"
+  # Despliega las imágenes recién subidas en el entorno de STAGING.
+  # Se ejecuta AUTOMÁTICAMENTE sin intervención humana.
+  # Corre DESPUÉS de que todas las imágenes fueron subidas a GHCR.
+  # ────────────────────────────────────────────────────────────────────────────
   deploy-staging:
     name: Deploy to Staging
+
+    # Espera a que build-and-push termine exitosamente para los 5 servicios
     needs: build-and-push
+
     runs-on: ubuntu-latest
+
+    # "environment" vincula este job con un Environment de GitHub.
+    # Los Environments se configuran en Settings → Environments del repo y permiten:
+    #   - Variables específicas del entorno (staging tiene su propia DB URL, etc.)
+    #   - Secretos específicos del entorno (STAGING_HOST, STAGING_SSH_KEY)
+    #   - Reglas de protección (aprobadores, ramas permitidas, etc.)
     environment:
       name: staging
-      url: https://staging.mercasimple.example.com
+      url: https://staging.mercasimple.example.com  # URL visible en GitHub Actions
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # El deploy real sería via SSH al servidor de staging para hacer
+      # "docker compose pull && docker compose up -d".
+      # Los pasos están comentados como referencia; descomenta y adapta a tu infra.
       - name: Deploy to staging
         run: |
           echo "Deploying commit ${{ github.sha }} to staging..."
-          # Example: SSH into staging server and update compose
+          # Ejemplo de deploy via SSH:
           # ssh $STAGING_HOST "cd /opt/mercasimple && \
           #   docker compose pull && \
           #   docker compose up -d --no-build"
           echo "Staging deploy complete"
         env:
-          STAGING_HOST: ${{ secrets.STAGING_HOST }}
-          SSH_KEY:       ${{ secrets.STAGING_SSH_KEY }}
+          # Estos secretos vienen del Environment "staging" configurado en GitHub.
+          # NUNCA los hardcodees aquí; siempre referencia a secrets.
+          STAGING_HOST: ${{ secrets.STAGING_HOST }}       # IP o hostname del servidor
+          SSH_KEY:      ${{ secrets.STAGING_SSH_KEY }}    # Clave SSH privada para conectarse
 
+      # Después de desplegar, verifica que staging responde correctamente.
+      # En producción real harías curl a los endpoints críticos.
       - name: Smoke test staging
         run: |
           echo "Running smoke tests against staging..."
           # curl -f https://staging.mercasimple.example.com/health
+          # curl -f https://staging.mercasimple.example.com/products
           echo "Smoke tests passed"
 
-  # ── Deploy to production (manual approval required) ────────────────────────
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 3: "deploy-production"
+  # Despliega en PRODUCCIÓN. Requiere APROBACIÓN MANUAL.
+  #
+  # ¿Cómo funciona la aprobación manual?
+  # El Environment "production" en GitHub Settings tiene "Required reviewers".
+  # Cuando este job está a punto de ejecutarse, GitHub pausa el pipeline y
+  # envía una notificación por email/Slack a los revisores configurados.
+  # Un revisor debe entrar a GitHub → Actions → aprobar el deploy.
+  # Sin aprobación, el job queda en estado "waiting" indefinidamente.
+  # ────────────────────────────────────────────────────────────────────────────
   deploy-production:
     name: Deploy to Production
+
+    # Solo empieza si staging fue exitoso (staging actúa como validación previa)
     needs: deploy-staging
+
     runs-on: ubuntu-latest
+
+    # "production" environment tiene required reviewers configurados en GitHub.
+    # Aquí es donde ocurre la PAUSA y espera de aprobación manual.
     environment:
       name: production
       url: https://mercasimple.example.com
@@ -113,7 +226,6 @@ jobs:
       - name: Deploy to production
         run: |
           echo "Deploying commit ${{ github.sha }} to production..."
-          # Example: SSH into production and update
           # ssh $PROD_HOST "cd /opt/mercasimple && \
           #   docker compose pull && \
           #   docker compose up -d --no-build"
@@ -122,17 +234,28 @@ jobs:
           PROD_HOST: ${{ secrets.PROD_HOST }}
           SSH_KEY:   ${{ secrets.PROD_SSH_KEY }}
 
+      # Verifica que producción está sana después del deploy
       - name: Verify production health
         run: |
           echo "Verifying production health endpoints..."
           # curl -f https://mercasimple.example.com/health
           echo "Production health OK"
 
-  # ── Tag release ───────────────────────────────────────────────────────────
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 4: "tag-release"
+  # Crea un tag Git en el repositorio que marca exactamente qué código
+  # está en producción ahora mismo.
+  # Fundamental para el ROLLBACK: puedes hacer checkout del tag anterior y redesplegar.
+  # ────────────────────────────────────────────────────────────────────────────
   tag-release:
     name: Tag Release
+
+    # Solo se ejecuta después de un deploy a producción exitoso
     needs: deploy-production
+
     runs-on: ubuntu-latest
+
+    # Necesita permiso de escritura en el repo para crear y pushear el tag
     permissions:
       contents: write
 
@@ -140,14 +263,31 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
+          # fetch-depth: 0 → Descarga TODO el historial de commits.
+          # Por defecto (fetch-depth: 1) solo descarga el último commit,
+          # lo que impide hacer "git tag" correctamente.
           fetch-depth: 0
 
+      # Crea y pushea un tag Git con formato: release-20260610-a3f9b2c
+      # Esto permite ver en GitHub exactamente qué versión está en producción.
       - name: Create release tag
         run: |
+          # Toma los primeros 7 caracteres del SHA del commit
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+
+          # Fecha de hoy en formato YYYYMMDD (ej: 20260610)
           DATE=$(date +%Y%m%d)
+
+          # Nombre del tag (ej: release-20260610-a3f9b2c)
           TAG="release-${DATE}-${SHORT_SHA}"
+
+          # Configura el nombre e email del autor del tag (bot de GitHub Actions)
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Crea un tag ANOTADO (-a): tiene mensaje, fecha y autor.
+          # Los tags anotados son preferibles a los ligeros para releases.
           git tag -a "$TAG" -m "Production release $TAG"
+
+          # Sube el tag al repositorio remoto (origin = GitHub)
           git push origin "$TAG"

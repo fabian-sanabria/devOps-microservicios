@@ -1,63 +1,133 @@
-version: "3.9"
+# ─────────────────────────────────────────────────────────────────────────────
+# docker-compose.override.yml  →  Sobrescrituras para DESARROLLO LOCAL
+#
+# ¿Cómo funciona el "override"?
+# Docker Compose lee PRIMERO docker-compose.yml y LUEGO este archivo,
+# fusionando ambos de forma inteligente:
+#   - Los valores de override SOBREESCRIBEN los del base.
+#   - Las listas (ports, volumes, environment) se SUMAN (merge), no se reemplazan.
+#
+# Este archivo se aplica AUTOMÁTICAMENTE si simplemente ejecutas:
+#   docker compose up
+#
+# Para IGNORARLO (producción real):
+#   docker compose -f docker-compose.yml up
+#
+# El propósito de este archivo es:
+#   1. Exponer los puertos de las bases de datos al host para usar con TablePlus,
+#      DBeaver, pgAdmin o cualquier cliente de DB en tu máquina.
+#   2. Activar hot-reload en los microservicios: cuando editas código,
+#      NestJS detecta el cambio y reinicia automáticamente (sin rebuild).
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Development overrides — hot-reload + exposed ports
-# Merged automatically by:  docker compose up
-# ─────────────────────────────────────────────────────────────────────────────
+version: "3.9"
 
 services:
 
-  # ── Expose infra ports locally ─────────────────────────────────────────────
+  # ────────────────────────────────────────────────────────────────────────────
+  # BASES DE DATOS: Exponer puertos al host para herramientas externas
+  #
+  # En docker-compose.yml NO exponemos estos puertos (seguridad).
+  # En desarrollo los abrimos para poder conectarse con clientes de DB.
+  #
+  # Formato de ports: "PUERTO_HOST:PUERTO_CONTENEDOR"
+  # Usamos puertos distintos en el host para evitar conflictos entre DBs
+  # (no podemos tener dos Postgres escuchando en el mismo puerto del host).
+  # ────────────────────────────────────────────────────────────────────────────
 
   db-auth:
     ports:
+      # Tu máquina:5433 → contenedor db-auth:5432
+      # Conéctate con: psql -h localhost -p 5433 -U auth_user -d auth
       - "5433:5432"
 
   db-catalog:
     ports:
+      # Tu máquina:5434 → contenedor db-catalog:5432
       - "5434:5432"
 
   db-orders:
     ports:
+      # Tu máquina:5435 → contenedor db-orders:5432
       - "5435:5432"
 
   db-payments:
     ports:
+      # Tu máquina:5436 → contenedor db-payments:5432
       - "5436:5432"
 
   redis:
     ports:
+      # Expone Redis al host para usar redis-cli o RedisInsight localmente
+      # redis-cli -h localhost -p 6379
       - "6379:6379"
 
   rabbitmq:
     ports:
+      # Puerto AMQP estándar → para que libs como amqplib puedan conectarse
+      # desde tu máquina directamente (sin Docker)
       - "5672:5672"
-      - "15672:15672"   # Management UI
+      # Puerto de la interfaz web de administración de RabbitMQ.
+      # Ábrela en: http://localhost:15672
+      # Usuario/contraseña: los del .env (por defecto guest/guest)
+      - "15672:15672"
 
-  # ── Services in dev mode (hot-reload) ─────────────────────────────────────
+  # ────────────────────────────────────────────────────────────────────────────
+  # MICROSERVICIOS EN MODO DESARROLLO (hot-reload)
+  #
+  # Cambios clave respecto al docker-compose.yml base:
+  #   1. "target: build" → Usa la etapa de BUILD del Dockerfile multi-stage,
+  #      no la de runtime. Esa etapa tiene devDependencies y el compilador TypeScript.
+  #   2. "command: npm run start:dev" → Arranca NestJS con --watch (usa ts-node
+  #      y chokidar para detectar cambios en archivos .ts y reiniciar el servidor).
+  #   3. "volumes: ./src:/app/src:ro" → Monta tu carpeta src local DENTRO del
+  #      contenedor. Cuando guardas un archivo en tu editor, el cambio se refleja
+  #      inmediatamente dentro del contenedor y NestJS lo recarga.
+  #      ":ro" = read-only (el contenedor no puede escribir en tu carpeta local).
+  #   4. "ports" → Expone el puerto de cada servicio a tu máquina para hacer
+  #      peticiones directas (sin pasar por el gateway), útil para probar con Postman.
+  # ────────────────────────────────────────────────────────────────────────────
 
   auth-service:
     build:
       context: ./auth-service
+      # "target: build" → Se detiene en la etapa AS build del Dockerfile.
+      # Esa etapa instala TODAS las dependencias (incluyendo devDependencies
+      # como @nestjs/cli y ts-jest) que son necesarias para hot-reload y tests.
       target: build
+
+    # Sobrescribe el CMD del Dockerfile (que sería "node dist/main").
+    # npm run start:dev activa el modo watch de NestJS.
     command: npm run start:dev
+
     environment:
+      # Sobreescribe NODE_ENV=production del archivo base.
+      # En "development" NestJS muestra stack traces completos y
+      # TypeORM usa "synchronize: true" (crea/modifica tablas automáticamente).
       NODE_ENV: development
+
     volumes:
+      # Sincroniza tu código fuente local con el contenedor en tiempo real.
+      # Formato: "./ruta/local:/ruta/en/contenedor:modo"
+      # :ro = read-only: el contenedor puede leer pero no modificar tus archivos
       - ./auth-service/src:/app/src:ro
+
     ports:
+      # Accede directamente al auth-service: http://localhost:3001/auth/login
+      # Sin override, solo el gateway expone puertos.
       - "3001:3001"
 
   catalog-service:
     build:
       context: ./catalog-service
-      target: build
+      target: build   # Etapa de build con devDependencies para hot-reload
     command: npm run start:dev
     environment:
       NODE_ENV: development
     volumes:
       - ./catalog-service/src:/app/src:ro
     ports:
+      # Acceso directo: http://localhost:3002/products
       - "3002:3002"
 
   orders-service:
@@ -70,6 +140,7 @@ services:
     volumes:
       - ./orders-service/src:/app/src:ro
     ports:
+      # Acceso directo: http://localhost:3003/cart
       - "3003:3003"
 
   payments-service:
@@ -82,4 +153,5 @@ services:
     volumes:
       - ./payments-service/src:/app/src:ro
     ports:
+      # Acceso directo: http://localhost:3004/health
       - "3004:3004"
