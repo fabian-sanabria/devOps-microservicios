@@ -125,7 +125,7 @@ jobs:
       # Si la cobertura cae del umbral definido en package.json (70%), el job FALLA.
       - name: Run unit tests with coverage
         working-directory: ${{ matrix.service }}
-        run: npm run test:cov
+        run: npm run test:cov 
         env:
           # La variable CI=true hace que Jest no use colores en el output
           # y active comportamientos específicos para entornos CI (sin TTY).
