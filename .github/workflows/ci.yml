@@ -98,11 +98,13 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}   # Usa la variable global definida arriba
           cache: npm                               # Tipo de caché (también soporta "yarn", "pnpm")
-          # GitHub cachea la carpeta ~/.npm basándose en el hash del package-lock.json.
-          # Si el lock no cambió, npm ci reutiliza el caché → mucho más rápido.
-          cache-dependency-path: ${{ matrix.service }}/package-lock.json
+          # Cachea basándose en AMBOS package-lock.json: el del servicio y el de la raíz.
+          # Si cualquiera cambia, el caché se invalida y reinstala todo desde cero.
+          cache-dependency-path: |
+            ${{ matrix.service }}/package-lock.json
+            package-lock.json
 
-      # Step 3: Instala dependencias de forma REPRODUCIBLE.
+      # Step 3a: Instala dependencias del microservicio de forma REPRODUCIBLE.
       # "npm ci" (clean install) es más estricto que "npm install":
       #   - Siempre elimina node_modules antes de instalar
       #   - Falla si package.json y package-lock.json están desincronizados
@@ -111,14 +113,21 @@ jobs:
         working-directory: ${{ matrix.service }}   # Entra a la carpeta del servicio
         run: npm ci
 
+      # Step 3b: Instala ESLint desde la raíz del monorepo.
+      # El .eslintrc.js raíz es compartido por todos los servicios.
+      # "npm install" en vez de "npm ci" porque la raíz no tiene package-lock.json aún.
+      - name: Install root ESLint tooling
+        run: npm install
+        # Sin working-directory → corre en la raíz del repo (donde está .eslintrc.js)
+
       # Step 4: Análisis estático del código (linting).
-      # ESLint busca errores de estilo, variables sin usar, código peligroso, etc.
-      # "|| true" al final hace que aunque ESLint falle, el step NO cancele el job.
-      # Útil mientras se termina de configurar el linter en todos los servicios.
-      # En producción deberías quitar el "|| true" para que el lint sea obligatorio.
+      # Corre desde la RAÍZ del repo donde está .eslintrc.js compartido.
+      # Apunta al src del servicio actual de la matrix (ej: lint:auth-service).
+      # Sin "|| true" → si ESLint encuentra ERRORES (no warnings), el job FALLA y bloquea el PR.
+      # Los warnings aparecen en el log como información pero no cancelan el pipeline.
       - name: Lint
-        working-directory: ${{ matrix.service }}
-        run: npm run lint || true
+        run: npm run lint:${{ matrix.service }}
+        # Sin working-directory → corre en la raíz del repo (donde está .eslintrc.js)
 
       # Step 5: Ejecuta los tests unitarios Y genera reporte de cobertura.
       # "npm run test:cov" es equivalente a: jest --coverage
