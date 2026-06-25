@@ -16,7 +16,7 @@ export class UsersController {
 
   @Patch('profile')
   async updateProfile(@Req() req: any, @Body() dto: UpdateUserDto) {
-    var user = await this.usersService.update(req.user.sub, dto);
+    const user = await this.usersService.update(req.user.sub, dto);
     return this.usersService.toProfile(user);
   }
 }
