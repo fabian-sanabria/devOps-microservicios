@@ -130,6 +130,13 @@ jobs:
         run: npm run lint:${{ matrix.service }}
         # Sin working-directory → corre en la raíz del repo (donde está .eslintrc.js)
 
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+
       # Step 5: Ejecuta los tests unitarios Y genera reporte de cobertura.
       # "npm run test:cov" es equivalente a: jest --coverage
       # Si la cobertura cae del umbral definido en package.json (70%), el job FALLA.
