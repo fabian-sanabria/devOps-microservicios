@@ -10,7 +10,7 @@ export class UsersController {
 
   @Get('profile')
   async getProfile(@Req() req: any) {
-    var user = await this.usersService.findById(req.user.sub);
+    const user = await this.usersService.findById(req.user.sub);
     return this.usersService.toProfile(user);
   }
 
