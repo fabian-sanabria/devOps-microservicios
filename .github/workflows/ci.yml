@@ -126,7 +126,7 @@ jobs:
       # Sin "|| true" → si ESLint encuentra ERRORES (no warnings), el job FALLA y bloquea el PR.
       # Los warnings aparecen en el log como información pero no cancelan el pipeline.
       - name: Lint
-        working-directory: mercasimple/
+        
         run: npm run lint:${{ matrix.service }}
         # Sin working-directory → corre en la raíz del repo (donde está .eslintrc.js)
 
