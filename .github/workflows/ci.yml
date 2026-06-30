@@ -131,11 +131,7 @@ jobs:
         # Sin working-directory → corre en la raíz del repo (donde está .eslintrc.js)
 
 
-      - name: SonarCloud Scan
-        uses: SonarSource/sonarqube-scan-action@v5
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-
+      
 
       # Step 5: Ejecuta los tests unitarios Y genera reporte de cobertura.
       # "npm run test:cov" es equivalente a: jest --coverage
@@ -148,7 +144,13 @@ jobs:
           # y active comportamientos específicos para entornos CI (sin TTY).
           CI: true
 
-      # Step 6: Guarda el reporte de cobertura como "artifact" de GitHub.
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+
+      # Step 6: Guarda el reporte de cobertura como "artifact" de GitHubb.
       # Los artifacts son archivos adjuntos al workflow run, descargables desde
       # la interfaz de GitHub por 7 días. Útil para auditar cobertura.
       - name: Upload coverage report
