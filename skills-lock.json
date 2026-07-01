@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "sonarqube-mcp": {
+      "source": "giuseppe-trisciuoglio/developer-kit",
+      "sourceType": "github",
+      "skillPath": "plugins/developer-kit-tools/skills/sonarqube-mcp/SKILL.md",
+      "computedHash": "9f1a35541258f286218e04d2ab8a2df7aa8ed45e4db8d3b932eef3fb09943492"
+    }
+  }
+}
