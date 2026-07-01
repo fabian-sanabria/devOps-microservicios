@@ -144,12 +144,6 @@ jobs:
           # y active comportamientos específicos para entornos CI (sin TTY).
           CI: true
 
-      - name: SonarCloud Scan
-        uses: SonarSource/sonarqube-scan-action@v5
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-
-
       # Step 6: Guarda el reporte de cobertura como "artifact" de GitHubb.
       # Los artifacts son archivos adjuntos al workflow run, descargables desde
       # la interfaz de GitHub por 7 días. Útil para auditar cobertura.
@@ -162,6 +156,67 @@ jobs:
           path: ${{ matrix.service }}/coverage/
           # Después de 7 días GitHub elimina el artifact automáticamente
           retention-days: 7
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB: "sonarcloud"
+  # Análisis de calidad y seguridad con SonarCloud para TODO el monorepo.
+  # A diferencia del scan anterior, corre UNA sola vez (no en matrix): así el
+  # análisis es único y consistente en lugar de 4 análisis compitiendo entre sí.
+  # Descarga la cobertura de los 4 servicios (generada en el job "test") y se la
+  # entrega a Sonar para reportar el % de cobertura.
+  # ────────────────────────────────────────────────────────────────────────────
+  sonarcloud:
+    name: SonarCloud
+    # Espera a que TODOS los tests (y su cobertura) terminen antes de analizar.
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # Sonar necesita el historial git completo para detectar "new code"
+          # (código nuevo del PR) y hacer blame correcto. Sin esto, el análisis
+          # de código nuevo y el quality gate de PR son imprecisos.
+          fetch-depth: 0
+
+      # Restaura la cobertura de cada servicio en su carpeta original
+      # (<service>/coverage/), tal cual la subió el job "test" como artifact.
+      # Cada lcov.info queda junto a su código para que Sonar lo asocie bien.
+      - name: Download auth-service coverage
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-auth-service
+          path: auth-service/coverage
+
+      - name: Download catalog-service coverage
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-catalog-service
+          path: catalog-service/coverage
+
+      - name: Download orders-service coverage
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-orders-service
+          path: orders-service/coverage
+
+      - name: Download payments-service coverage
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-payments-service
+          path: payments-service/coverage
+
+      # Ejecuta el análisis. La configuración (projectKey, organization, rutas de
+      # cobertura, quality gate) se lee de sonar-project.properties en la raíz.
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          # Token guardado en los secrets del repo (Settings → Secrets → Actions).
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          # URL de SonarCloud (SonarQube Cloud). Necesario para que la acción v5
+          # apunte al servicio cloud y no a un SonarQube self-hosted.
+          SONAR_HOST_URL: https://sonarcloud.io
 
   # ────────────────────────────────────────────────────────────────────────────
   # JOB 2: "docker-build"
